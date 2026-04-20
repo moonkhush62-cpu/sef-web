@@ -163,6 +163,61 @@ function getVerdict(totalScore: number): ScanResultData["verdict"] {
   return "Phishing";
 }
 
+// Query domain age via multiple public CORS-friendly APIs
+async function fetchDomainAgeMonths(domain: string): Promise<number | null> {
+  // 1. Try whoisjsonapi.com — free, CORS-enabled
+  try {
+    const res = await fetch(
+      `https://www.whoisjsonapi.com/v1/${encodeURIComponent(domain)}`,
+      { signal: AbortSignal.timeout(6000) }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const created =
+        data?.domain_age?.created_date ||
+        data?.created_date ||
+        data?.creation_date;
+      if (created) {
+        const ageMs = Date.now() - new Date(created).getTime();
+        return Math.floor(ageMs / (1000 * 60 * 60 * 24 * 30));
+      }
+    }
+  } catch { /* try next */ }
+
+  // 2. Try rdap.org directly (works in browser for most TLDs)
+  try {
+    const res = await fetch(
+      `https://rdap.org/domain/${encodeURIComponent(domain)}`,
+      {
+        headers: { Accept: "application/rdap+json" },
+        signal: AbortSignal.timeout(7000),
+      }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.events)) {
+        const reg = data.events.find(
+          (e: { eventAction: string }) => e.eventAction === "registration"
+        );
+        if (reg?.eventDate) {
+          const ageMs = Date.now() - new Date(reg.eventDate).getTime();
+          return Math.floor(ageMs / (1000 * 60 * 60 * 24 * 30));
+        }
+      }
+    }
+  } catch { /* try next */ }
+
+  // 3. Try Supabase edge function as last resort
+  try {
+    const { data, error } = await supabase.functions.invoke("domain-age", {
+      body: { domain },
+    });
+    if (!error && data?.ageMonths != null) return data.ageMonths;
+  } catch { /* all failed */ }
+
+  return null;
+}
+
 export async function analyzeUrl(url: string): Promise<ScanResultData> {
   const parameters: ParameterResult[] = [
     analyzeUrlLength(url),
@@ -170,21 +225,12 @@ export async function analyzeUrl(url: string): Promise<ScanResultData> {
     analyzeSuspiciousChars(url),
   ];
 
-  // Domain age check via edge function
   const domain = extractDomain(url);
   let domainAgeResult: ParameterResult;
 
   if (domain) {
-    try {
-      const { data, error } = await supabase.functions.invoke("domain-age", {
-        body: { domain },
-      });
-
-      if (error) throw error;
-      domainAgeResult = analyzeDomainAge(data?.ageMonths ?? null);
-    } catch {
-      domainAgeResult = analyzeDomainAge(null);
-    }
+    const ageMonths = await fetchDomainAgeMonths(domain);
+    domainAgeResult = analyzeDomainAge(ageMonths);
   } else {
     domainAgeResult = analyzeDomainAge(null);
   }
